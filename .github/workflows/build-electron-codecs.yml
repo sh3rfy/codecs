@@ -1,0 +1,215 @@
+name: Build Electron with media codecs
+
+# Buduje wlasny Electron z obsluga HEVC, AC-3, E-AC-3, AC-4, DTS, TrueHD
+# (5rahim/electron-media-patch). Uruchom recznie z zakladki Actions.
+#
+# Po zakonczeniu pobierz artefakt (zip) i podaj go aplikacji:
+#   cd app
+#   npm run fetch -- --url ~/Downloads/electron-linux-v42.4.0.zip --key linux-x64-custom --version 42.4.0
+#   npm start
+
+on:
+  workflow_dispatch:
+    inputs:
+      electron_version:
+        description: 'Tag Electron do zbudowania (musi miec patches/<tag> w repo patchy)'
+        required: true
+        default: 'v42.4.0'
+      patches_repo:
+        description: 'Repo z katalogiem patches/<tag>'
+        required: true
+        default: '5rahim/electron-media-patch'
+      target:
+        description: 'Co zbudowac'
+        required: true
+        default: 'linux'
+        type: choice
+        options:
+          - linux
+          - windows
+          - both
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    if: ${{ inputs.target == 'linux' || inputs.target == 'both' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl wget python3-pip build-essential ccache
+          sudo apt-get install -y libnss3-dev libgtk-3-dev libxss-dev libasound2-dev
+          sudo apt-get install -y libdrm-dev libgbm-dev libxrandr-dev libxcomposite-dev
+          sudo apt-get install -y libxdamage-dev libxfixes-dev libx11-dev libxext-dev
+          sudo apt-get install -y libxrender-dev libxtst-dev libpango1.0-dev
+          sudo apt-get install -y libcairo2-dev libatspi2.0-dev libatk-bridge2.0-dev
+          sudo apt-get install -y libgdk-pixbuf-2.0-dev libdbus-1-dev libnotify-dev
+          sudo apt-get install -y libsecret-1-dev libpulse-dev libcap-dev libcups2-dev
+
+      - name: Setup depot_tools
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "$PWD/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Clone patches
+        run: git clone --depth 1 "https://github.com/${{ inputs.patches_repo }}" patches-repo
+
+      - name: Fetch Electron source
+        env:
+          VERSION: ${{ inputs.electron_version }}
+        run: |
+          set -euxo pipefail
+          test -d "patches-repo/patches/$VERSION" || { echo "Brak patches/$VERSION w repo patchy"; exit 1; }
+          mkdir electron && cd electron
+          gclient config --name "src/electron" --unmanaged https://github.com/electron/electron
+          gclient sync --with_branch_heads --with_tags --jobs=8
+          cd src/electron
+          git fetch origin --tags
+          git checkout "$VERSION"
+          cd ../..
+          gclient sync --with_branch_heads --with_tags -f --jobs=8
+
+      - name: Apply patches
+        env:
+          VERSION: ${{ inputs.electron_version }}
+        run: |
+          set -euxo pipefail
+          mkdir -p electron/patches
+          cp "patches-repo/patches/$VERSION"/*.patch electron/patches/
+          cd electron/src
+          for p in ../patches/*.patch; do git apply --check "$p"; done
+          for p in ../patches/*.patch; do git apply "$p"; done
+          git diff --check
+
+      - name: gn gen
+        env:
+          VERSION: ${{ inputs.electron_version }}
+        run: |
+          set -euxo pipefail
+          cd electron/src
+          EV="${VERSION#v}"
+          export CHROMIUM_BUILDTOOLS_PATH="$PWD/buildtools"
+          gn gen out/Release-linux-x64 --args="import(\"//electron/build/args/release.gn\") target_os=\"linux\" target_cpu=\"x64\" proprietary_codecs=true ffmpeg_branding=\"Chrome\" enable_platform_ac3_eac3_audio=true enable_platform_ac4_audio=true enable_platform_dts_audio=true enable_platform_dolby_vision=true enable_platform_hevc=true enable_hevc_parser_and_hw_decoder=true use_remoteexec=false use_reclient=false use_siso=false override_electron_version=\"$EV\""
+
+      - name: Build ffmpeg
+        run: |
+          set -euxo pipefail
+          cd electron/src
+          autoninja -C out/Release-linux-x64 third_party/ffmpeg:ffmpeg
+
+      - name: Build Electron
+        run: |
+          set -euxo pipefail
+          cd electron/src
+          autoninja -C out/Release-linux-x64 electron electron:electron_dist_zip
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: electron-linux-${{ inputs.electron_version }}
+          path: electron/src/out/Release-linux-x64/dist/*.zip
+          if-no-files-found: error
+
+  build-windows:
+    if: ${{ inputs.target == 'windows' || inputs.target == 'both' }}
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Free disk space
+        run: |
+          Remove-Item -Recurse -Force "$env:AGENT_TOOLSDIRECTORY\Python" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\hostedtoolcache\windows\Java_*" -ErrorAction SilentlyContinue
+
+      - name: Setup depot_tools
+        shell: cmd
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo %CD%\depot_tools>> %GITHUB_PATH%
+          echo DEPOT_TOOLS_WIN_TOOLCHAIN=0>> %GITHUB_ENV%
+
+      - name: Clone patches
+        run: git clone --depth 1 "https://github.com/${{ inputs.patches_repo }}" patches-repo
+
+      - name: Fetch Electron source
+        shell: cmd
+        env:
+          VERSION: ${{ inputs.electron_version }}
+        run: |
+          if not exist "patches-repo\patches\%VERSION%" (echo Brak patches/%VERSION% & exit /b 1)
+          mkdir electron && cd electron
+          call gclient config --name "src/electron" --unmanaged https://github.com/electron/electron
+          call gclient sync --with_branch_heads --with_tags --jobs=8
+          cd src\electron
+          call git fetch origin --tags
+          call git checkout %VERSION%
+          cd ..\..
+          call gclient sync --with_branch_heads --with_tags -f --jobs=8
+
+      - name: Apply patches
+        shell: cmd
+        env:
+          VERSION: ${{ inputs.electron_version }}
+        run: |
+          mkdir electron\patches
+          copy "patches-repo\patches\%VERSION%\*.patch" electron\patches\
+          cd electron\src
+          for %%p in (..\patches\*.patch) do git apply --check "%%p" || exit /b 1
+          for %%p in (..\patches\*.patch) do git apply "%%p" || exit /b 1
+
+      - name: gn gen
+        shell: cmd
+        env:
+          VERSION: ${{ inputs.electron_version }}
+        run: |
+          cd electron\src
+          set CHROMIUM_BUILDTOOLS_PATH=%CD%\buildtools
+          set EV=%VERSION:v=%
+          call gn gen out\Release-win-x64 --args="import(\"//electron/build/args/release.gn\") target_os=\"win\" target_cpu=\"x64\" proprietary_codecs=true ffmpeg_branding=\"Chrome\" enable_platform_ac3_eac3_audio=true enable_platform_ac4_audio=true enable_platform_dts_audio=true enable_platform_dolby_vision=true enable_platform_hevc=true enable_hevc_parser_and_hw_decoder=true use_remoteexec=false use_reclient=false use_siso=false override_electron_version=\"%EV%\""
+
+      - name: Build ffmpeg
+        shell: cmd
+        run: |
+          cd electron\src
+          call autoninja -C out\Release-win-x64 third_party/ffmpeg:ffmpeg
+
+      - name: Build Electron
+        shell: cmd
+        run: |
+          cd electron\src
+          call autoninja -C out\Release-win-x64 electron electron:electron_dist_zip
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: electron-windows-${{ inputs.electron_version }}
+          path: electron/src/out/Release-win-x64/dist/*.zip
+          if-no-files-found: error
