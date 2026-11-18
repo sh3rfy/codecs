@@ -46,6 +46,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Stage numbers
+        id: n
+        run: echo "next=$(( ${{ inputs.stage }} + 1 ))" >> "$GITHUB_OUTPUT"
+
       - name: Free disk space
         run: |
           set -x
@@ -179,7 +183,7 @@ jobs:
         if: ${{ steps.build.outputs.done != 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: out-${{ inputs.electron_version }}-stage${{ inputs.stage + 1 }}
+          name: out-${{ inputs.electron_version }}-stage${{ steps.n.outputs.next }}
           path: /mnt/pack/out.tar.zst
           retention-days: 2
           compression-level: 0
