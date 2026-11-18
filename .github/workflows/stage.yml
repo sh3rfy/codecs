@@ -1,0 +1,194 @@
+# Jeden etap budowania Electrona (Linux x64).
+#
+# Pełny build Chromium/Electron na darmowym runnerze (4 rdzenie) trwa dłużej
+# niż limit 6 h na job, więc dzielimy go na etapy. Każdy etap:
+#   1. robi miejsce na dysku (darmowy runner ma ~14 GB wolnego),
+#   2. pobiera źródła (płytko, bez historii),
+#   3. ustawia wszystkim źródłom starą datę modyfikacji - dzięki temu ninja
+#      uznaje pliki odtworzone z poprzedniego etapu za aktualne,
+#   4. odtwarza katalog out/ z artefaktu poprzedniego etapu,
+#   5. buduje przez ~4 h i przerywa się czysto (SIGINT),
+#   6. zapisuje out/ jako artefakt dla następnego etapu albo - gdy skończył -
+#      publikuje gotowy zip Electrona.
+name: stage
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        type: number
+        required: true
+      electron_version:
+        type: string
+        required: true
+      patches_repo:
+        type: string
+        required: true
+      build_minutes:
+        type: number
+        default: 230
+    outputs:
+      done:
+        value: ${{ jobs.build.outputs.done }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    outputs:
+      done: ${{ steps.build.outputs.done }}
+    env:
+      VERSION: ${{ inputs.electron_version }}
+      WORK: /home/runner/e
+      OUT: /mnt/out
+      DEPOT_TOOLS_UPDATE: '0'
+      GCLIENT_SUPPRESS_GIT_VERSION_WARNING: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          set -x
+          df -h / /mnt
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
+            /usr/local/share/boost /usr/local/.ghcup /usr/share/swift /usr/local/share/powershell \
+            /usr/local/share/chromium /usr/local/lib/node_modules /opt/microsoft /opt/google \
+            /usr/lib/jvm /opt/az /usr/local/julia* || true
+          docker system prune -af >/dev/null 2>&1 || true
+          sudo apt-get clean
+          sudo mkdir -p "$OUT" && sudo chown "$USER" "$OUT"
+          # mały swap na /mnt - linkowanie potrafi zjeść dużo RAM-u
+          sudo fallocate -l 8G /mnt/swap && sudo chmod 600 /mnt/swap && sudo mkswap /mnt/swap && sudo swapon /mnt/swap
+          df -h / /mnt
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: depot_tools
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Fetch Electron source (shallow)
+        run: |
+          set -euxo pipefail
+          mkdir -p "$WORK" && cd "$WORK"
+          gclient config --name "src/electron" "https://github.com/electron/electron@refs/tags/$VERSION"
+          gclient sync --no-history --shallow --jobs 16 -D
+          cd src/electron && git describe --tags --exact-match
+          df -h / /mnt
+
+      - name: Build deps
+        run: |
+          sudo "$WORK/src/build/install-build-deps.sh" --no-prompt --no-arm --no-chromeos-fonts --no-nacl || \
+          sudo apt-get install -y build-essential ninja-build pkg-config libnss3-dev libgtk-3-dev \
+            libxkbcommon-dev libx11-xcb-dev libxss-dev libasound2-dev libdrm-dev libgbm-dev \
+            libxrandr-dev libxcomposite-dev libxdamage-dev libcups2-dev libpulse-dev libsecret-1-dev \
+            libdbus-1-dev libnotify-dev libcap-dev
+          sudo apt-get install -y zstd
+
+      - name: Apply codec patches
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 "https://github.com/${{ inputs.patches_repo }}" "$HOME/patches-repo"
+          test -d "$HOME/patches-repo/patches/$VERSION" || { echo "Brak patches/$VERSION"; exit 1; }
+          cd "$WORK/src"
+          for p in "$HOME/patches-repo/patches/$VERSION"/*.patch; do git apply --check "$p"; done
+          for p in "$HOME/patches-repo/patches/$VERSION"/*.patch; do git apply "$p"; done
+
+      - name: Normalize source mtimes
+        # Świeży checkout ma "teraz" jako datę plików - ninja przebudowałby
+        # wszystko. Stała, stara data = obiekty z poprzedniego etapu są nowsze.
+        run: |
+          cd "$WORK/src"
+          find . -path ./out -prune -o -print0 | xargs -0 -P 8 -n 2000 touch -h -d '2001-01-01 00:00:00' || true
+
+      - name: Restore out/ from previous stage
+        if: ${{ inputs.stage > 1 }}
+        uses: actions/download-artifact@v4
+        with:
+          name: out-${{ inputs.electron_version }}-stage${{ inputs.stage }}
+          path: /mnt/restore
+
+      - name: Unpack out/
+        run: |
+          set -euxo pipefail
+          if [ -f /mnt/restore/out.tar.zst ]; then
+            tar --zstd -xpf /mnt/restore/out.tar.zst -C "$OUT"
+            rm -rf /mnt/restore
+          fi
+          ln -sfn "$OUT" "$WORK/src/out"
+          df -h / /mnt
+
+      - name: gn gen
+        run: |
+          set -euxo pipefail
+          cd "$WORK/src"
+          EV="${VERSION#v}"
+          if [ ! -f out/Release/build.ninja ]; then
+            gn gen out/Release --args="import(\"//electron/build/args/release.gn\") target_os=\"linux\" target_cpu=\"x64\" \
+              proprietary_codecs=true ffmpeg_branding=\"Chrome\" \
+              enable_platform_hevc=true enable_hevc_parser_and_hw_decoder=true \
+              enable_platform_ac3_eac3_audio=true enable_platform_ac4_audio=true \
+              enable_platform_dts_audio=true enable_platform_dolby_vision=true \
+              use_remoteexec=false use_reclient=false use_siso=false \
+              symbol_level=0 blink_symbol_level=0 v8_symbol_level=0 \
+              is_cfi=false use_thin_lto=false \
+              override_electron_version=\"$EV\""
+          fi
+          cat out/Release/args.gn
+
+      - name: Build (time-boxed)
+        id: build
+        run: |
+          set -uxo pipefail
+          cd "$WORK/src"
+          export NINJA_SUMMARIZE_BUILD=1
+          timeout -s INT -k 10m "${{ inputs.build_minutes }}m" \
+            autoninja -C out/Release electron electron:electron_dist_zip
+          rc=$?
+          echo "ninja exit: $rc"
+          if [ $rc -eq 0 ]; then
+            echo "done=true" >> "$GITHUB_OUTPUT"
+          elif [ $rc -eq 124 ]; then
+            # limit czasu etapu - kontynuacja w następnym
+            echo "done=false" >> "$GITHUB_OUTPUT"
+          else
+            exit $rc
+          fi
+          df -h / /mnt
+
+      - name: Check progress
+        if: ${{ steps.build.outputs.done != 'true' }}
+        run: |
+          cd "$WORK/src"
+          ninja -C out/Release -n electron electron:electron_dist_zip 2>/dev/null | tail -1 || true
+
+      - name: Pack out/ for next stage
+        if: ${{ steps.build.outputs.done != 'true' }}
+        run: |
+          set -euxo pipefail
+          mkdir -p /mnt/pack
+          tar --zstd -C "$OUT" -cpf /mnt/pack/out.tar.zst .
+          ls -lh /mnt/pack
+
+      - name: Upload out/ for next stage
+        if: ${{ steps.build.outputs.done != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: out-${{ inputs.electron_version }}-stage${{ inputs.stage + 1 }}
+          path: /mnt/pack/out.tar.zst
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload Electron dist
+        if: ${{ steps.build.outputs.done == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: electron-linux-${{ inputs.electron_version }}
+          path: /mnt/out/Release/dist.zip
+          if-no-files-found: error
+          compression-level: 0
