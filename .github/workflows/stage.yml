@@ -100,8 +100,10 @@ jobs:
           git clone --depth 1 "https://github.com/${{ inputs.patches_repo }}" "$HOME/patches-repo"
           test -d "$HOME/patches-repo/patches/$VERSION" || { echo "Brak patches/$VERSION"; exit 1; }
           cd "$WORK/src"
-          for p in "$HOME/patches-repo/patches/$VERSION"/*.patch; do git apply --check "$p"; done
-          for p in "$HOME/patches-repo/patches/$VERSION"/*.patch; do git apply "$p"; done
+          # patch ffmpeg ma ścieżki względem third_party/ffmpeg, reszta względem src
+          dir_for() { case "$1" in *ffmpeg*) echo third_party/ffmpeg;; *) echo .;; esac; }
+          for p in "$HOME/patches-repo/patches/$VERSION"/*.patch; do git -C "$(dir_for "$p")" apply --check "$p"; done
+          for p in "$HOME/patches-repo/patches/$VERSION"/*.patch; do git -C "$(dir_for "$p")" apply "$p"; done
 
       - name: Normalize source mtimes
         # Świeży checkout ma "teraz" jako datę plików - ninja przebudowałby
