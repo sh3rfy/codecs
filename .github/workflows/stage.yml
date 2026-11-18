@@ -74,6 +74,8 @@ jobs:
       - name: depot_tools
         run: |
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          # bez tego gn/autoninja nie znajdą pythona depot_tools (DEPOT_TOOLS_UPDATE=0)
+          DEPOT_TOOLS_UPDATE=1 "$HOME/depot_tools/ensure_bootstrap"
           echo "$HOME/depot_tools" >> "$GITHUB_PATH"
 
       - name: Fetch Electron source (shallow)
